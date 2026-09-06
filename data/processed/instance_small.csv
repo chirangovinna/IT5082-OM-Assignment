@@ -1,0 +1,16 @@
+project_id,cost,votes,name,category,beneficiaries,selected,latitude,longitude,primary_category
+1276,136000,1555,Ławki dla wytchnienia wraz z udogodnieniami,"urban greenery,public space,welfare","people with disabilities,seniors,adults,youth,children",0,52.13291852217767,21.025502904447336,urban greenery
+1273,150000,1030,Geriatolot,"public space,welfare,public transit and roads","people with disabilities,seniors,adults,youth,children",0,,,public space
+1781,1000000,12530,"Sadźmy i zadbajmy o drzewa, krzewy, byliny i rośliny cebulowe dla Warszawy - bo warto","public transit and roads,urban greenery,public space","people with disabilities,seniors,adults,youth,children",1,,,public transit and roads
+1283,870000,6888,Warszawska różowa skrzyneczka międzypokoleniowa,"sport,culture,welfare","seniors,people with disabilities,adults,youth,children",0,,,sport
+1157,82500,3370,Odpocznij opiekunie - wieczór wytchnieniowy dla opiekunów osób w spektrum autyzmu,"environmental protection,culture","people with disabilities,seniors,adults",0,52.26149813798566,20.977201759815,environmental protection
+762,141300,2879,"Eko pływanie po Wiśle kajakami, deskami sup lub łódką elektryczną","sport,environmental protection,education","people with disabilities,seniors,adults,youth,children",0,52.227029662546,21.050218600035,sport
+65,3715000,3137,Zielone i bezpieczne dla ptaków wiaty przystankowe w Warszawie,"public space,environmental protection,public transit and roads","people with disabilities,seniors,adults,youth,children",0,,,public space
+1791,1100000,789,Budowa boiska wielofunkcyjnego przy ogródkach działkowych zlokalizowanych koło Toru Łyżwiarskiego Stegny,sport,"people with disabilities,seniors,adults,youth,children",0,52.188022994646,21.044525977304,sport
+1279,25000,1012,Piknik medyczny,"sport,public space,welfare","people with disabilities,seniors,adults,youth,children",0,,,sport
+462,44500,2568,Warsztaty pisarskie dla dzieci – całoroczny cykl warsztatów dla dzieci,"welfare,culture,education","adults,children",0,,,welfare
+1823,6000000,1730,Bilet Całoroczny Niewidoczny,"public space,environmental protection,public transit and roads","people with disabilities,adults,youth",0,,,public space
+1115,150000,4993,Wygodne oczekiwanie na wizytę u lekarza specjalisty- zakup siedzisk dla pacjentów przychodni przyszpitalnej Szpitala Bielańskiego,public space,"people with disabilities,seniors,adults,youth,children",0,52.286773760941,20.951228141785,public space
+1812,300000,2279,Rolkowa stolica - cykl przejazdów na rolkach ulicami Warszawy,"sport,public space","people with disabilities,seniors,adults,youth,children",0,52.22500494645652,21.00860996456557,sport
+544,778200,2758,BIG BROTHER WARSZAWA - nowe mobilne kamery monitoringu miejskiego dla każdej dzielnicy Warszawy.,public space,"people with disabilities,seniors,adults,youth,children",0,52.23094541746999,21.028262278634887,public space
+1611,320000,6556,Bezpłatne toalety miejskie - postaw Zygmunta,"urban greenery,health,public space","people with disabilities,seniors,adults,youth,children",0,,,urban greenery

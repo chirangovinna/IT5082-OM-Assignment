@@ -1,0 +1,11 @@
+Source instance: Warszawa 2023
+Full budget: 30,339,246 PLN
+Full project count: 138
+Total cost of all candidate projects: 175,021,441
+Actual (greedy-rule) selection: 22 projects, cost 30,336,684, total votes captured 290,845
+
+Prepared instances:
+  full_instance    n= 138  budget=  30,339,246  total_cost=   175,021,441  total_votes=   648,967
+  instance_small   n=  15  budget=   2,567,686  total_cost=    14,812,500  total_votes=    54,074
+  instance_medium  n=  30  budget=   8,570,663  total_cost=    49,442,555  total_votes=   166,555
+  instance_large   n=  60  budget=  13,210,421  total_cost=    76,208,451  total_votes=   250,316
