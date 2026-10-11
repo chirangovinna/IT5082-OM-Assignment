@@ -10,9 +10,6 @@ Repair:      infeasible individuals (over budget) are repaired by greedily
              inside the feasible region, which converges much faster for
              knapsack-style problems than penalty-based fitness.
 
-This is a self-contained implementation (no DEAP/PyGAD dependency) so the
-selection/crossover/mutation/repair logic is fully transparent for the
-report and viva.
 """
 
 import random
@@ -42,16 +39,7 @@ def _repair(
     categories: np.ndarray = None,
     category_caps: dict = None,
 ) -> np.ndarray:
-    """
-    Repair an infeasible individual by dropping projects until all constraints
-    are satisfied: the overall budget AND, if provided, every category cap.
 
-    Strategy: repeatedly find the *worst offending* violated constraint
-    (budget or a specific category), and within it drop the project with the
-    lowest value/cost ratio, until every constraint holds. This is a greedy
-    repair -- it doesn't guarantee the "best" feasible neighbor, but it's fast
-    and keeps the GA firmly inside the feasible region each generation.
-    """
     chromosome = chromosome.copy()
     category_caps = category_caps or {}
 
@@ -212,7 +200,7 @@ if __name__ == "__main__":
 
     PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-    csv_arg = sys.argv[1] if len(sys.argv) > 1 else "data/processed/instance_small.csv"
+    csv_arg = sys.argv[1] if len(sys.argv) > 1 else "data/processed/full_instance.csv"
     csv_path = Path(csv_arg)
     if not csv_path.is_absolute() and not csv_path.exists():
         csv_path = PROJECT_ROOT / csv_arg

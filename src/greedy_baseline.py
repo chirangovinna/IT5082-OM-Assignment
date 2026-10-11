@@ -4,9 +4,6 @@ Classic greedy heuristic baseline for 0/1 knapsack-style budget allocation:
 sort projects by value/cost ratio (votes per PLN) descending, and fund
 projects in that order until the budget is exhausted.
 
-Included as a third comparison point alongside the exact CP-SAT method and
-the Genetic Algorithm -- it's fast and simple, but doesn't backtrack, so it
-generally leaves a quality gap relative to both.
 """
 
 import time
@@ -64,7 +61,7 @@ if __name__ == "__main__":
 
     PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-    csv_arg = sys.argv[1] if len(sys.argv) > 1 else "data/processed/instance_small.csv"
+    csv_arg = sys.argv[1] if len(sys.argv) > 1 else "data/processed/full_instance.csv"
     csv_path = Path(csv_arg)
     if not csv_path.is_absolute() and not csv_path.exists():
         csv_path = PROJECT_ROOT / csv_arg

@@ -1,0 +1,4 @@
+method,total_value,total_cost,n_selected,overlap_with_actual
+Actual (Warszawa city rule),290845.0,30336684.0,22,22
+CP-SAT (exact),371661.0,30300476.0,82,18
+Genetic Algorithm,368787.0,30214676.0,76,18
