@@ -1,27 +1,3 @@
-"""
-pb_parser.py
-Parses Pabulib (.pb) participatory budgeting files into clean pandas
-DataFrames ready for optimization modeling (ILP / CP-SAT / GA / SA).
-
-Pabulib format reference: http://pabulib.org
-A .pb file has three sections, each starting with a bare header line:
-    META
-    key;value
-    ...
-    PROJECTS
-    project_id;cost;votes;...
-    ...
-    VOTES
-    voter_id;...
-    ...
-
-Usage:
-    from pb_parser import parse_pb
-
-    meta, projects = parse_pb("data/Poland_Warszawa_2023.pb")
-    print(meta["budget"], len(projects))
-"""
-
 import csv
 import io
 from pathlib import Path

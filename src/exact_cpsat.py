@@ -48,17 +48,7 @@ def solve_budget_allocation(
     category_min_counts: Optional[Dict[str, int]] = None,
     time_limit_sec: float = 60.0,
 ) -> SolveResult:
-    """
-    Solve the 0/1 budget allocation problem exactly with CP-SAT.
 
-    Args:
-        df: DataFrame with columns ['project_id', 'cost', 'votes', 'primary_category'].
-        budget: total budget B.
-        category_caps: optional {category_name: max_spend} constraints.
-        category_min_counts: optional {category_name: min_num_projects} constraints.
-        time_limit_sec: CP-SAT wall-clock time limit (exact result if solver
-            reports OPTIMAL before this is hit; otherwise best-found + gap).
-    """
     model = cp_model.CpModel()
     n = len(df)
     ids = df["project_id"].tolist()
@@ -125,7 +115,7 @@ if __name__ == "__main__":
 
     PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-    csv_arg = sys.argv[1] if len(sys.argv) > 1 else "data/processed/instance_small.csv"
+    csv_arg = sys.argv[1] if len(sys.argv) > 1 else "data/processed/full_instance.csv"
     csv_path = Path(csv_arg)
     if not csv_path.is_absolute() and not csv_path.exists():
         csv_path = PROJECT_ROOT / csv_arg
