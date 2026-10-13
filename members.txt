@@ -1,0 +1,17 @@
+Team Members Information
+========================
+
+Member 1:
+Student ID: MS26912684
+Email: ms26912684@my.sliit.lk
+Name: S.Thanushan
+
+Member 2:
+Student ID: MS26902616
+Email: ms26902616@my.sliit.lk
+Name: G.C. Devinda
+
+Contribution:
+
+- Member 1: Data pipeline, constraint generation, greedy baseline, mathematical formulation, report and video assembly
+- Member 2: Genetic Algorithm, exact CP-SAT model, comparative evaluation, report and video assembly
