@@ -1,0 +1,1077 @@
+CODE APPENDIX - IT5082 Optimization Methods Assignment
+Repository: https://github.com/chirangovinna/IT5082-OM-Assignment
+
+==============================================================================
+FILE: main.py
+==============================================================================
+"""
+main.py - single entry point to reproduce every result in the report.
+
+Usage (from repo root):
+    python main.py            # data prep -> comparison -> report figures
+"""
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+SRC = ROOT / "src"
+
+STEPS = [
+    ("Data preparation", ["data_prep.py"]),
+    ("Exact vs GA vs Greedy comparison", ["comparison.py"]),
+    ("Report figures (10-seed GA study, timing)", ["report_figures.py"]),
+]
+
+for title, cmd in STEPS:
+    print(f"\n=== {title} ===")
+    subprocess.run([sys.executable, *cmd], cwd=SRC, check=True)
+print("\nAll steps finished. See results/ for tables and figures.")
+
+
+==============================================================================
+FILE: src/pb_parser.py
+==============================================================================
+import csv
+import io
+from pathlib import Path
+from typing import Dict, Tuple
+
+import pandas as pd
+
+
+def parse_pb(filepath: str, load_votes: bool = False) -> Tuple[Dict, pd.DataFrame, pd.DataFrame]:
+    """
+    Parse a Pabulib .pb file.
+
+    Args:
+        filepath: path to the .pb file.
+        load_votes: if True, also parse and return the VOTES section
+                    (can be large — skip if you only need META + PROJECTS).
+
+    Returns:
+        meta: dict of metadata key -> value (numeric fields auto-cast to int/float)
+        projects: DataFrame of all projects (one row per project)
+        votes: DataFrame of votes (empty DataFrame if load_votes=False)
+    """
+    filepath = Path(filepath)
+    raw = filepath.read_text(encoding="utf-8")
+
+    # Split into sections by the bare section-header lines
+    sections = {"META": [], "PROJECTS": [], "VOTES": []}
+    current = None
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped in sections:
+            current = stripped
+            continue
+        if current is not None and stripped != "":
+            sections[current].append(line)
+
+    # --- META ---
+    meta_rows = list(csv.reader(sections["META"], delimiter=";"))
+    header = meta_rows[0]  # ["key", "value"]
+    meta = {}
+    for row in meta_rows[1:]:
+        if len(row) < 2:
+            continue
+        key, value = row[0], row[1]
+        meta[key] = _coerce_numeric(value)
+
+    # --- PROJECTS ---
+    projects_text = "\n".join(sections["PROJECTS"])
+    projects = pd.read_csv(io.StringIO(projects_text), sep=";", dtype=str)
+    projects = _clean_projects(projects)
+
+    # --- VOTES (optional, can be large) ---
+    votes = pd.DataFrame()
+    if load_votes and sections["VOTES"]:
+        votes_text = "\n".join(sections["VOTES"])
+        votes = pd.read_csv(io.StringIO(votes_text), sep=";", dtype=str)
+
+    return meta, projects, votes
+
+
+def _coerce_numeric(value: str):
+    """Cast META values to int/float where possible, else leave as string."""
+    try:
+        if "." in value:
+            return float(value)
+        return int(value)
+    except (ValueError, TypeError):
+        return value
+
+
+def _clean_projects(df: pd.DataFrame) -> pd.DataFrame:
+    """Cast known numeric columns and tidy up the projects table."""
+    numeric_cols = ["project_id", "cost", "votes", "selected", "latitude", "longitude"]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # project_id and selected are integer-like
+    if "project_id" in df.columns:
+        df["project_id"] = df["project_id"].astype("Int64")
+    if "selected" in df.columns:
+        df["selected"] = df["selected"].astype("Int64")
+
+    # category is a comma-separated multi-label field — keep as string,
+    # but also provide a `primary_category` convenience column
+    if "category" in df.columns:
+        df["primary_category"] = (
+            df["category"].fillna("uncategorized").str.split(",").str[0].str.strip()
+        )
+
+    return df.reset_index(drop=True)
+
+
+def summarize(meta: Dict, projects: pd.DataFrame) -> None:
+    """Print a quick sanity-check summary — useful as a first data-prep step."""
+    print(f"Instance:        {meta.get('unit')} {meta.get('instance')}")
+    print(f"Total budget:    {meta.get('budget'):,} {meta.get('currency', '')}")
+    print(f"Num projects:    {len(projects)} (meta says {meta.get('num_projects')})")
+    print(f"Total cost of ALL projects: {projects['cost'].sum():,}")
+    print(f"Num selected (actual, greedy rule): {int(projects['selected'].sum())}")
+    print(f"Cost of actually-selected projects: {projects.loc[projects['selected'] == 1, 'cost'].sum():,}")
+    print(f"Categories: {sorted(projects['primary_category'].unique())}")
+    print()
+    print(projects[["project_id", "cost", "votes", "primary_category", "selected"]].head())
+
+
+if __name__ == "__main__":
+    import sys
+
+    path = sys.argv[1] if len(sys.argv) > 1 else "data/sample_warszawa2023.pb"
+    meta, projects, _ = parse_pb(path)
+    summarize(meta, projects)
+
+
+==============================================================================
+FILE: src/data_prep.py
+==============================================================================
+"""
+data_prep.py
+Loads the parsed Pabulib dataset and prepares instances of varying size
+for the comparative exact-vs-heuristic evaluation.
+
+Produces:
+    data/processed/full_instance.csv       - all 138 projects (heuristic scalability test)
+    data/processed/instance_small.csv      - 15 projects  (exact ILP - fast, exhaustive-ish)
+    data/processed/instance_medium.csv     - 30 projects  (exact ILP - still tractable)
+    data/processed/instance_large.csv      - 60 projects  (exact ILP starts to slow down)
+    data/processed/summary_stats.txt       - quick text summary for the report
+
+Each instance CSV also carries its own scaled-down `budget` (proportional
+to the subset's total cost), so smaller instances remain a meaningful
+selection problem rather than "just fund everything".
+"""
+
+from pathlib import Path
+
+import pandas as pd
+
+from pb_parser import parse_pb
+
+RANDOM_SEED = 42
+INSTANCE_SIZES = {"instance_small": 15, "instance_medium": 30, "instance_large": 60}
+# Fraction of a subset's total project cost to use as that subset's budget cap.
+# Kept the same fraction as the full instance (budget / total_cost) so difficulty
+# (selectivity) is comparable across instance sizes.
+BUDGET_FRACTION = None  # computed from the full instance at runtime
+
+
+def build_instances(raw_pb_path: str, out_dir: str = "data/processed") -> dict:
+    meta, projects, _ = parse_pb(raw_pb_path)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    full_budget = meta["budget"]
+    full_cost_total = projects["cost"].sum()
+    budget_fraction = full_budget / full_cost_total
+
+    # Full instance (for heuristic scalability testing)
+    full_df = projects.copy()
+    full_df.attrs["budget"] = full_budget
+    full_df.to_csv(out_dir / "full_instance.csv", index=False)
+
+    written = {"full_instance": (full_df, full_budget)}
+
+    # Smaller random subsets (for exact-method runtime comparison)
+    rng_state = RANDOM_SEED
+    for name, size in INSTANCE_SIZES.items():
+        subset = projects.sample(n=size, random_state=rng_state).reset_index(drop=True)
+        subset_budget = round(subset["cost"].sum() * budget_fraction)
+        subset.to_csv(out_dir / f"{name}.csv", index=False)
+        written[name] = (subset, subset_budget)
+        rng_state += 1  # vary seed slightly per size so subsets differ
+
+    # Write a companion budgets file (small csv doesn't carry .attrs on reload)
+    budgets = pd.DataFrame(
+        [{"instance": k, "n_projects": len(v[0]), "budget": v[1]} for k, v in written.items()]
+    )
+    budgets.to_csv(out_dir / "budgets.csv", index=False)
+
+    _write_summary(meta, projects, written, out_dir)
+    return written
+
+
+def _write_summary(meta, projects, written, out_dir):
+    lines = []
+    lines.append(f"Source instance: {meta.get('unit')} {meta.get('instance')}")
+    lines.append(f"Full budget: {meta.get('budget'):,} {meta.get('currency')}")
+    lines.append(f"Full project count: {len(projects)}")
+    lines.append(f"Total cost of all candidate projects: {projects['cost'].sum():,}")
+    lines.append(
+        f"Actual (greedy-rule) selection: {int(projects['selected'].sum())} projects, "
+        f"cost {projects.loc[projects['selected'] == 1, 'cost'].sum():,}, "
+        f"total votes captured {projects.loc[projects['selected'] == 1, 'votes'].sum():,}"
+    )
+    lines.append("")
+    lines.append("Prepared instances:")
+    for name, (df, budget) in written.items():
+        lines.append(
+            f"  {name:16s} n={len(df):4d}  budget={budget:>12,.0f}  "
+            f"total_cost={df['cost'].sum():>14,.0f}  total_votes={df['votes'].sum():>10,.0f}"
+        )
+    text = "\n".join(lines)
+    (out_dir / "summary_stats.txt").write_text(text)
+    print(text)
+
+
+if __name__ == "__main__":
+    import sys
+
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+    path_arg = sys.argv[1] if len(sys.argv) > 1 else "data/Poland_Warszawa_2023.pb"
+    path = Path(path_arg)
+    if not path.is_absolute() and not path.exists():
+        path = PROJECT_ROOT / path_arg
+
+    build_instances(path, out_dir=PROJECT_ROOT / "data/processed")
+
+
+==============================================================================
+FILE: src/constraints.py
+==============================================================================
+"""
+constraints.py
+Generates the category budget-cap constraints used by all three solvers,
+turning the problem from single-constraint 0/1 knapsack into a
+multi-dimensional knapsack.
+
+"""
+
+from typing import Dict
+
+import pandas as pd
+
+
+def compute_category_caps(df: pd.DataFrame, budget: float, slack_factor: float = 1.25) -> Dict[str, float]:
+
+    total_votes = df["votes"].sum()
+    caps = {}
+    for cat, group in df.groupby("primary_category"):
+        vote_share = group["votes"].sum() / total_votes
+        proportional_cap = budget * vote_share * slack_factor
+        # Cap can never exceed the category's own total project cost (no point
+        # allocating budget a category can't physically spend).
+        caps[cat] = min(proportional_cap, group["cost"].sum())
+    return caps
+
+
+==============================================================================
+FILE: src/exact_cpsat.py
+==============================================================================
+"""
+exact_cpsat.py
+Exact method: 0/1 Budget Allocation (multi-dimensional knapsack) solved
+with Google OR-Tools CP-SAT.
+
+Formulation
+-----------
+Decision variables:
+    x_i in {0,1}   for each project i   (1 = funded)
+
+Objective:
+    maximize  sum_i  v_i * x_i          (v_i = votes, our value/benefit proxy)
+
+Constraints:
+    (1) Budget:          sum_i c_i * x_i <= B
+    (2) Category cap:    sum_{i in cat k} c_i * x_i <= cat_budget_k   (optional)
+    (3) Category min:    sum_{i in cat k} x_i        >= min_count_k   (optional)
+
+CP-SAT is used instead of a pure LP-relaxation ILP solver (e.g. CBC via
+PuLP) because it natively handles large numbers of binary variables and
+linear constraints very efficiently, and gives us a hard time-limit with
+a provable optimality gap if the limit is hit.
+"""
+
+import time
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+import pandas as pd
+from ortools.sat.python import cp_model
+
+
+@dataclass
+class SolveResult:
+    selected_ids: List[int]
+    total_value: float
+    total_cost: float
+    runtime_sec: float
+    status: str
+    optimality_gap: Optional[float] = None
+    n_projects: int = 0
+
+
+def solve_budget_allocation(
+    df: pd.DataFrame,
+    budget: float,
+    category_caps: Optional[Dict[str, float]] = None,
+    category_min_counts: Optional[Dict[str, int]] = None,
+    time_limit_sec: float = 60.0,
+) -> SolveResult:
+
+    model = cp_model.CpModel()
+    n = len(df)
+    ids = df["project_id"].tolist()
+    costs = df["cost"].astype(int).tolist()
+    values = df["votes"].astype(int).tolist()
+    categories = df["primary_category"].tolist()
+
+    x = [model.NewBoolVar(f"x_{i}") for i in range(n)]
+
+    # Constraint 1: budget
+    model.Add(sum(costs[i] * x[i] for i in range(n)) <= int(budget))
+
+    # Constraint 2 (optional): per-category spending caps
+    if category_caps:
+        for cat, cap in category_caps.items():
+            idxs = [i for i in range(n) if categories[i] == cat]
+            if idxs:
+                model.Add(sum(costs[i] * x[i] for i in idxs) <= int(cap))
+
+    # Constraint 3 (optional): per-category minimum project counts
+    if category_min_counts:
+        for cat, min_count in category_min_counts.items():
+            idxs = [i for i in range(n) if categories[i] == cat]
+            if idxs:
+                model.Add(sum(x[i] for i in idxs) >= min_count)
+
+    # Objective: maximize total value (votes) captured
+    model.Maximize(sum(values[i] * x[i] for i in range(n)))
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = time_limit_sec
+    solver.parameters.num_search_workers = 8
+
+    start = time.perf_counter()
+    status = solver.Solve(model)
+    runtime = time.perf_counter() - start
+
+    status_name = solver.StatusName(status)
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        selected = [ids[i] for i in range(n) if solver.Value(x[i]) == 1]
+        total_value = sum(values[i] for i in range(n) if solver.Value(x[i]) == 1)
+        total_cost = sum(costs[i] for i in range(n) if solver.Value(x[i]) == 1)
+        gap = None
+        if status == cp_model.FEASIBLE:
+            best_bound = solver.BestObjectiveBound()
+            gap = (best_bound - total_value) / max(total_value, 1) * 100
+    else:
+        selected, total_value, total_cost, gap = [], 0, 0, None
+
+    return SolveResult(
+        selected_ids=selected,
+        total_value=total_value,
+        total_cost=total_cost,
+        runtime_sec=runtime,
+        status=status_name,
+        optimality_gap=gap,
+        n_projects=n,
+    )
+
+
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+    csv_arg = sys.argv[1] if len(sys.argv) > 1 else "data/processed/full_instance.csv"
+    csv_path = Path(csv_arg)
+    if not csv_path.is_absolute() and not csv_path.exists():
+        csv_path = PROJECT_ROOT / csv_arg
+
+    df = pd.read_csv(csv_path)
+    budgets = pd.read_csv(PROJECT_ROOT / "data/processed/budgets.csv")
+    inst_name = csv_path.stem
+    budget = float(budgets.loc[budgets["instance"] == inst_name, "budget"].iloc[0])
+
+    from constraints import compute_category_caps
+    category_caps = compute_category_caps(df, budget)
+
+    result = solve_budget_allocation(df, budget, category_caps=category_caps)
+    print(f"Instance: {inst_name}  (n={result.n_projects})")
+    print(f"Status: {result.status}")
+    print(f"Runtime: {result.runtime_sec:.4f} s")
+    print(f"Selected {len(result.selected_ids)} projects, total cost {result.total_cost:,}")
+    print(f"Total value (votes) captured: {result.total_value:,}")
+    if result.optimality_gap is not None:
+        print(f"Optimality gap: {result.optimality_gap:.2f}%")
+
+
+==============================================================================
+FILE: src/heuristic_ga.py
+==============================================================================
+"""
+heuristic_ga.py
+Heuristic method: Genetic Algorithm for the 0/1 Budget Allocation problem.
+
+Chromosome:  binary vector x of length n (1 = project funded)
+Fitness:     total value (votes) captured, subject to budget feasibility
+Repair:      infeasible individuals (over budget) are repaired by greedily
+             dropping the worst value/cost-ratio projects until feasible,
+             rather than just penalizing fitness -- this keeps the search
+             inside the feasible region, which converges much faster for
+             knapsack-style problems than penalty-based fitness.
+
+"""
+
+import random
+import time
+from dataclasses import dataclass
+from typing import List, Tuple
+
+import numpy as np
+import pandas as pd
+
+
+@dataclass
+class GAResult:
+    selected_ids: List[int]
+    total_value: float
+    total_cost: float
+    runtime_sec: float
+    best_fitness_per_gen: List[float]
+    n_projects: int = 0
+
+
+def _repair(
+    chromosome: np.ndarray,
+    costs: np.ndarray,
+    values: np.ndarray,
+    budget: float,
+    categories: np.ndarray = None,
+    category_caps: dict = None,
+) -> np.ndarray:
+
+    chromosome = chromosome.copy()
+    category_caps = category_caps or {}
+
+    def violated_constraints():
+        selected = chromosome == 1
+        violations = []
+        total_cost = costs[selected].sum()
+        if total_cost > budget:
+            violations.append(("budget", None, total_cost - budget))
+        if categories is not None:
+            for cat, cap in category_caps.items():
+                cat_mask = selected & (categories == cat)
+                cat_cost = costs[cat_mask].sum()
+                if cat_cost > cap:
+                    violations.append(("category", cat, cat_cost - cap))
+        return violations
+
+    violations = violated_constraints()
+    max_iters = int(chromosome.sum()) + 1  # safety bound
+    it = 0
+    while violations and it < max_iters:
+        it += 1
+        # Address the largest violation first
+        violations.sort(key=lambda v: v[2], reverse=True)
+        kind, cat, _ = violations[0]
+
+        selected = chromosome == 1
+        if kind == "budget":
+            candidate_mask = selected
+        else:
+            candidate_mask = selected & (categories == cat)
+
+        candidate_idx = np.where(candidate_mask)[0]
+        if len(candidate_idx) == 0:
+            break  # nothing left to drop for this constraint; give up gracefully
+
+        ratio = values[candidate_idx] / np.maximum(costs[candidate_idx], 1)
+        worst = candidate_idx[np.argmin(ratio)]
+        chromosome[worst] = 0
+
+        violations = violated_constraints()
+
+    return chromosome
+
+
+def _fitness(chromosome: np.ndarray, values: np.ndarray) -> float:
+    return float(np.sum(values[chromosome == 1]))
+
+
+def _tournament_select(pop: np.ndarray, fitnesses: np.ndarray, k: int = 3) -> np.ndarray:
+    idxs = np.random.choice(len(pop), size=k, replace=False)
+    best = idxs[np.argmax(fitnesses[idxs])]
+    return pop[best].copy()
+
+
+def _crossover(parent1: np.ndarray, parent2: np.ndarray, rate: float = 0.8) -> Tuple[np.ndarray, np.ndarray]:
+    if random.random() > rate:
+        return parent1.copy(), parent2.copy()
+    point = random.randint(1, len(parent1) - 1)
+    child1 = np.concatenate([parent1[:point], parent2[point:]])
+    child2 = np.concatenate([parent2[:point], parent1[point:]])
+    return child1, child2
+
+
+def _mutate(chromosome: np.ndarray, rate: float = 0.02) -> np.ndarray:
+    mask = np.random.random(len(chromosome)) < rate
+    chromosome = chromosome.copy()
+    chromosome[mask] = 1 - chromosome[mask]
+    return chromosome
+
+
+def solve_budget_allocation_ga(
+    df: pd.DataFrame,
+    budget: float,
+    category_caps: dict = None,
+    population_size: int = 100,
+    generations: int = 200,
+    crossover_rate: float = 0.8,
+    mutation_rate: float = 0.02,
+    elitism: int = 2,
+    seed: int = 42,
+) -> GAResult:
+    """
+    Solve the 0/1 budget allocation problem with a Genetic Algorithm.
+
+    Args:
+        df: DataFrame with columns ['project_id', 'cost', 'votes', 'primary_category'].
+        budget: total budget B.
+        category_caps: optional {category_name: max_spend} constraints (multi-
+            dimensional knapsack). If None, only the overall budget applies.
+        population_size, generations, crossover_rate, mutation_rate, elitism: GA hyperparameters.
+        seed: RNG seed for reproducibility.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+
+    ids = df["project_id"].to_numpy()
+    costs = df["cost"].to_numpy(dtype=float)
+    values = df["votes"].to_numpy(dtype=float)
+    categories = df["primary_category"].to_numpy() if category_caps else None
+    n = len(df)
+
+    start = time.perf_counter()
+
+    # Initialize population: random binary vectors, then repaired to be feasible
+    population = np.random.randint(0, 2, size=(population_size, n))
+    population = np.array(
+        [_repair(ind, costs, values, budget, categories, category_caps) for ind in population]
+    )
+
+    best_fitness_per_gen = []
+    best_overall = population[0].copy()
+    best_overall_fitness = _fitness(best_overall, values)
+
+    for gen in range(generations):
+        fitnesses = np.array([_fitness(ind, values) for ind in population])
+
+        gen_best_idx = np.argmax(fitnesses)
+        if fitnesses[gen_best_idx] > best_overall_fitness:
+            best_overall_fitness = fitnesses[gen_best_idx]
+            best_overall = population[gen_best_idx].copy()
+        best_fitness_per_gen.append(best_overall_fitness)
+
+        # Elitism: carry the top individuals forward unchanged
+        elite_idx = np.argsort(fitnesses)[-elitism:]
+        new_population = [population[i].copy() for i in elite_idx]
+
+        while len(new_population) < population_size:
+            parent1 = _tournament_select(population, fitnesses)
+            parent2 = _tournament_select(population, fitnesses)
+            child1, child2 = _crossover(parent1, parent2, crossover_rate)
+            child1 = _mutate(child1, mutation_rate)
+            child2 = _mutate(child2, mutation_rate)
+            child1 = _repair(child1, costs, values, budget, categories, category_caps)
+            child2 = _repair(child2, costs, values, budget, categories, category_caps)
+            new_population.extend([child1, child2])
+
+        population = np.array(new_population[:population_size])
+
+    runtime = time.perf_counter() - start
+
+    selected_ids = [int(ids[i]) for i in range(n) if best_overall[i] == 1]
+    total_cost = float(np.sum(costs[best_overall == 1]))
+
+    return GAResult(
+        selected_ids=selected_ids,
+        total_value=best_overall_fitness,
+        total_cost=total_cost,
+        runtime_sec=runtime,
+        best_fitness_per_gen=best_fitness_per_gen,
+        n_projects=n,
+    )
+
+
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+    csv_arg = sys.argv[1] if len(sys.argv) > 1 else "data/processed/full_instance.csv"
+    csv_path = Path(csv_arg)
+    if not csv_path.is_absolute() and not csv_path.exists():
+        csv_path = PROJECT_ROOT / csv_arg
+
+    df = pd.read_csv(csv_path)
+    budgets = pd.read_csv(PROJECT_ROOT / "data/processed/budgets.csv")
+    inst_name = csv_path.stem
+    budget = float(budgets.loc[budgets["instance"] == inst_name, "budget"].iloc[0])
+
+    from constraints import compute_category_caps
+    category_caps = compute_category_caps(df, budget)
+
+    result = solve_budget_allocation_ga(df, budget, category_caps=category_caps)
+    print(f"Instance: {inst_name}  (n={result.n_projects})")
+    print(f"Runtime: {result.runtime_sec:.4f} s")
+    print(f"Selected {len(result.selected_ids)} projects, total cost {result.total_cost:,.0f}")
+    print(f"Total value (votes) captured: {result.total_value:,.0f}")
+
+
+==============================================================================
+FILE: src/greedy_baseline.py
+==============================================================================
+"""
+greedy_baseline.py
+Classic greedy heuristic baseline for 0/1 knapsack-style budget allocation:
+sort projects by value/cost ratio (votes per PLN) descending, and fund
+projects in that order until the budget is exhausted.
+
+"""
+
+import time
+from dataclasses import dataclass
+from typing import List
+
+import pandas as pd
+
+
+@dataclass
+class GreedyResult:
+    selected_ids: List[int]
+    total_value: float
+    total_cost: float
+    runtime_sec: float
+    n_projects: int = 0
+
+
+def solve_budget_allocation_greedy(df: pd.DataFrame, budget: float, category_caps: dict = None) -> GreedyResult:
+    start = time.perf_counter()
+
+    work = df.copy()
+    work["ratio"] = work["votes"] / work["cost"].replace(0, 1)
+    work = work.sort_values("ratio", ascending=False)
+
+    category_caps = category_caps or {}
+    category_spend = {cat: 0.0 for cat in category_caps}
+
+    selected_ids, total_cost, total_value = [], 0.0, 0.0
+    for _, row in work.iterrows():
+        cat = row.get("primary_category")
+        cat_cap = category_caps.get(cat)
+        cat_ok = cat_cap is None or (category_spend.get(cat, 0.0) + row["cost"] <= cat_cap)
+        if cat_ok and total_cost + row["cost"] <= budget:
+            selected_ids.append(int(row["project_id"]))
+            total_cost += row["cost"]
+            total_value += row["votes"]
+            if cat is not None and cat in category_spend:
+                category_spend[cat] += row["cost"]
+
+    runtime = time.perf_counter() - start
+
+    return GreedyResult(
+        selected_ids=selected_ids,
+        total_value=total_value,
+        total_cost=total_cost,
+        runtime_sec=runtime,
+        n_projects=len(df),
+    )
+
+
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+    csv_arg = sys.argv[1] if len(sys.argv) > 1 else "data/processed/full_instance.csv"
+    csv_path = Path(csv_arg)
+    if not csv_path.is_absolute() and not csv_path.exists():
+        csv_path = PROJECT_ROOT / csv_arg
+
+    df = pd.read_csv(csv_path)
+    budgets = pd.read_csv(PROJECT_ROOT / "data/processed/budgets.csv")
+    inst_name = csv_path.stem
+    budget = float(budgets.loc[budgets["instance"] == inst_name, "budget"].iloc[0])
+
+    from constraints import compute_category_caps
+    category_caps = compute_category_caps(df, budget)
+
+    result = solve_budget_allocation_greedy(df, budget, category_caps=category_caps)
+    print(f"Instance: {inst_name}  (n={result.n_projects})")
+    print(f"Runtime: {result.runtime_sec:.4f} s")
+    print(f"Selected {len(result.selected_ids)} projects, total cost {result.total_cost:,.0f}")
+    print(f"Total value (votes) captured: {result.total_value:,.0f}")
+
+
+==============================================================================
+FILE: src/comparison.py
+==============================================================================
+"""
+comparison.py
+Runs the exact CP-SAT method, the GA heuristic, and the greedy baseline
+across all prepared instances.
+"""
+
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import pandas as pd
+
+from exact_cpsat import solve_budget_allocation
+from greedy_baseline import solve_budget_allocation_greedy
+from heuristic_ga import solve_budget_allocation_ga
+from constraints import compute_category_caps
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+INSTANCES = ["instance_small", "instance_medium", "instance_large", "full_instance"]
+
+
+def run_all():
+    data_dir = PROJECT_ROOT / "data/processed"
+    results_dir = PROJECT_ROOT / "results"
+    results_dir.mkdir(exist_ok=True)
+
+    budgets = pd.read_csv(data_dir / "budgets.csv")
+
+    rows = []
+    ga_convergence_curves = {}
+
+    for inst in INSTANCES:
+        df = pd.read_csv(data_dir / f"{inst}.csv")
+        budget = float(budgets.loc[budgets["instance"] == inst, "budget"].iloc[0])
+        category_caps = compute_category_caps(df, budget)
+
+        exact = solve_budget_allocation(df, budget, category_caps=category_caps)
+        ga = solve_budget_allocation_ga(df, budget, category_caps=category_caps)
+        greedy = solve_budget_allocation_greedy(df, budget, category_caps=category_caps)
+
+        ga_convergence_curves[inst] = ga.best_fitness_per_gen
+
+        for method, res in [("CP-SAT (exact)", exact), ("Genetic Algorithm", ga), ("Greedy", greedy)]:
+            total_value = res.total_value
+            gap_vs_optimal = (
+                (exact.total_value - total_value) / exact.total_value * 100
+                if exact.total_value > 0
+                else None
+            )
+            rows.append(
+                {
+                    "instance": inst,
+                    "n_projects": len(df),
+                    "method": method,
+                    "total_value": total_value,
+                    "total_cost": res.total_cost,
+                    "n_selected": len(res.selected_ids),
+                    "runtime_sec": res.runtime_sec,
+                    "gap_vs_optimal_pct": round(gap_vs_optimal, 3) if gap_vs_optimal is not None else 0.0,
+                }
+            )
+
+        print(f"Done: {inst}")
+
+    results_df = pd.DataFrame(rows)
+    results_df.to_csv(results_dir / "comparison_table.csv", index=False)
+    print("\n" + results_df.to_string(index=False))
+
+    _plot_quality_vs_size(results_df, results_dir)
+    _plot_runtime_vs_size(results_df, results_dir)
+    _plot_ga_convergence(ga_convergence_curves, results_dir)
+    _compare_vs_actual(data_dir, results_dir, budgets)
+
+    return results_df
+
+
+def _plot_quality_vs_size(results_df, results_dir):
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for method in results_df["method"].unique():
+        sub = results_df[results_df["method"] == method].sort_values("n_projects")
+        ax.plot(sub["n_projects"], sub["total_value"], marker="o", label=method)
+    ax.set_xlabel("Number of candidate projects (instance size)")
+    ax.set_ylabel("Total value captured (votes)")
+    ax.set_title("Solution Quality vs. Instance Size")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(results_dir / "quality_vs_size.png", dpi=150)
+    plt.close(fig)
+
+
+def _plot_runtime_vs_size(results_df, results_dir):
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for method in results_df["method"].unique():
+        sub = results_df[results_df["method"] == method].sort_values("n_projects")
+        ax.plot(sub["n_projects"], sub["runtime_sec"], marker="o", label=method)
+    ax.set_xlabel("Number of candidate projects (instance size)")
+    ax.set_ylabel("Runtime (seconds)")
+    ax.set_title("Runtime vs. Instance Size")
+    ax.set_yscale("log")
+    ax.legend()
+    ax.grid(alpha=0.3, which="both")
+    fig.tight_layout()
+    fig.savefig(results_dir / "runtime_vs_size.png", dpi=150)
+    plt.close(fig)
+
+
+def _plot_ga_convergence(curves, results_dir):
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for inst, curve in curves.items():
+        ax.plot(curve, label=inst)
+    ax.set_xlabel("Generation")
+    ax.set_ylabel("Best fitness (total value / votes)")
+    ax.set_title("GA Convergence Across Instance Sizes")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(results_dir / "ga_convergence.png", dpi=150)
+    plt.close(fig)
+
+
+def _compare_vs_actual(data_dir, results_dir, budgets):
+    """Compare our methods' picks on the FULL instance against Warszawa's real (greedy-rule) selection."""
+    df = pd.read_csv(data_dir / "full_instance.csv")
+    budget = float(budgets.loc[budgets["instance"] == "full_instance", "budget"].iloc[0])
+    category_caps = compute_category_caps(df, budget)
+
+    exact = solve_budget_allocation(df, budget, category_caps=category_caps)
+    ga = solve_budget_allocation_ga(df, budget, category_caps=category_caps)
+
+    actual_selected = set(df.loc[df["selected"] == 1, "project_id"].tolist())
+    actual_value = df.loc[df["selected"] == 1, "votes"].sum()
+    actual_cost = df.loc[df["selected"] == 1, "cost"].sum()
+
+    rows = [
+        {
+            "method": "Actual (Warszawa city rule)",
+            "total_value": actual_value,
+            "total_cost": actual_cost,
+            "n_selected": len(actual_selected),
+            "overlap_with_actual": len(actual_selected),
+        },
+        {
+            "method": "CP-SAT (exact)",
+            "total_value": exact.total_value,
+            "total_cost": exact.total_cost,
+            "n_selected": len(exact.selected_ids),
+            "overlap_with_actual": len(set(exact.selected_ids) & actual_selected),
+        },
+        {
+            "method": "Genetic Algorithm",
+            "total_value": ga.total_value,
+            "total_cost": ga.total_cost,
+            "n_selected": len(ga.selected_ids),
+            "overlap_with_actual": len(set(ga.selected_ids) & actual_selected),
+        },
+    ]
+    out = pd.DataFrame(rows)
+    out.to_csv(results_dir / "vs_actual_selection.csv", index=False)
+    print("\nComparison vs. actual city selection (full instance):")
+    print(out.to_string(index=False))
+
+
+if __name__ == "__main__":
+    run_all()
+
+
+==============================================================================
+FILE: src/report_figures.py
+==============================================================================
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+from constraints import compute_category_caps
+from exact_cpsat import solve_budget_allocation
+from greedy_baseline import solve_budget_allocation_greedy
+from heuristic_ga import solve_budget_allocation_ga
+
+ROOT = Path(__file__).resolve().parent.parent
+DATA = ROOT / "data/processed"
+RES = ROOT / "results"
+OUT = RES / "report_figures"
+OUT.mkdir(parents=True, exist_ok=True)
+
+INK, MUTED, GRID = "#222222", "#777777", "#dddddd"
+C_EXACT, C_GA, C_GREEDY = "#1f5fa8", "#d9822b", "#6a994e"
+
+plt.rcParams.update({
+    "font.size": 9, "axes.edgecolor": MUTED, "axes.labelcolor": INK,
+    "xtick.color": INK, "ytick.color": INK,
+    "axes.spines.top": False, "axes.spines.right": False,
+    "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.6,
+})
+
+
+def load_or_make(name, maker):
+    """Return results/<name> as a DataFrame; if absent, build it with maker(), save it, and return it."""
+    path = RES / name
+    if path.exists():
+        return pd.read_csv(path)
+    print(f"{name} not found - computing it (this can take a minute)...")
+    df_new = maker()
+    df_new.to_csv(path, index=False)
+    return df_new
+
+
+# ---- shared inputs (same pipeline as comparison.py) -------------------------
+full = pd.read_csv(DATA / "full_instance.csv")
+budget = float(pd.read_csv(DATA / "budgets.csv").set_index("instance").loc["full_instance", "budget"])
+caps = compute_category_caps(full, budget)
+exact = solve_budget_allocation(full, budget, category_caps=caps)
+greedy = solve_budget_allocation_greedy(full, budget, category_caps=caps)
+OPT, GREEDY = exact.total_value, greedy.total_value
+
+INSTANCES = ["instance_small", "instance_medium", "instance_large", "full_instance"]
+_budgets = pd.read_csv(DATA / "budgets.csv").set_index("instance")["budget"]
+
+
+def _instance(name):
+    d = pd.read_csv(DATA / f"{name}.csv")
+    b = float(_budgets[name])
+    return d, b, compute_category_caps(d, b)
+
+
+def make_seeds_full():          # GA, 10 seeds, full instance, capped model
+    rows = []
+    for sd in range(10):
+        g = solve_budget_allocation_ga(full, budget, category_caps=caps, seed=sd)
+        rows.append(dict(seed=sd, votes=g.total_value, gap_pct=round((OPT - g.total_value) / OPT * 100, 3)))
+    return pd.DataFrame(rows)
+
+
+def make_convergence():         # GA convergence curve, seed 42, full instance
+    g = solve_budget_allocation_ga(full, budget, category_caps=caps, seed=42)
+    return pd.DataFrame({"generation": np.arange(len(g.best_fitness_per_gen)),
+                         "best_votes": np.array(g.best_fitness_per_gen)})
+
+
+def make_ga_per_size():         # GA, 10 seeds, every instance size
+    rows = []
+    for name in INSTANCES:
+        d, b, c = _instance(name)
+        opt = solve_budget_allocation(d, b, category_caps=c).total_value
+        runs = [solve_budget_allocation_ga(d, b, category_caps=c, seed=sd) for sd in range(10)]
+        vals = np.array([r.total_value for r in runs])
+        gaps = (opt - vals) / opt * 100
+        rows.append(dict(instance=name, n=len(d), optimum=opt, ga_mean=vals.mean(), ga_min=vals.min(),
+                         ga_max=vals.max(), gap_mean=gaps.mean(), gap_min=gaps.min(), gap_max=gaps.max(),
+                         n_optimal=int((vals == opt).sum()), time_mean=float(np.mean([r.runtime_sec for r in runs]))))
+    return pd.DataFrame(rows)
+
+
+def make_timing(repeats=15):    # CP-SAT and greedy, repeated runs, with and without caps
+    rows = []
+    for name in INSTANCES:
+        d, b, c = _instance(name)
+        for label, cc in (("no caps", None), ("with caps", c)):
+            ex_t = [solve_budget_allocation(d, b, category_caps=cc).runtime_sec for _ in range(repeats)]
+            gr_t = [solve_budget_allocation_greedy(d, b, category_caps=cc).runtime_sec for _ in range(repeats)]
+            rows.append(dict(instance=name, n=len(d), version=label, cpsat_median=np.median(ex_t),
+                             cpsat_min=min(ex_t), cpsat_max=max(ex_t), greedy_median=np.median(gr_t)))
+    return pd.DataFrame(rows)
+
+
+
+# ---- Figure 1: dataset ------------------------------------------------------
+fig, ax = plt.subplots(1, 2, figsize=(7.2, 2.9))
+ax[0].hist(np.log10(full["cost"]), bins=18, color=C_EXACT, edgecolor="white")
+ax[0].set_xlabel("project cost (PLN, log10 scale)")
+ax[0].set_ylabel("number of projects")
+ax[0].set_title("Costs are heavily right-skewed", fontsize=9, loc="left")
+ax[1].scatter(full["cost"], full["votes"], s=14, color=C_EXACT, alpha=0.75, edgecolor="white", linewidth=0.4)
+ax[1].set_xscale("log"); ax[1].set_yscale("log")
+ax[1].set_xlabel("cost (PLN, log)"); ax[1].set_ylabel("votes (log)")
+ax[1].set_title("Support is weakly tied to cost", fontsize=9, loc="left")
+fig.tight_layout(); fig.savefig(OUT / "fig1_data.png", dpi=200); plt.close(fig)
+
+
+# ---- Figure 2: optimality gap of 10 GA seeds on the full instance -----------
+seeds = load_or_make("supp_ga_seeds_full.csv", make_seeds_full).sort_values("gap_pct")
+greedy_gap = (OPT - GREEDY) / OPT * 100
+fig, ax = plt.subplots(figsize=(6.2, 2.6))
+ax.scatter(seeds["gap_pct"], np.zeros(len(seeds)), s=55, color=C_GA, edgecolor="white", zorder=3,
+           label="GA, one dot per seed (10 seeds)")
+ax.axvline(0, color=C_EXACT, lw=2, label="CP-SAT (optimal, 0%)")
+ax.axvline(greedy_gap, color=C_GREEDY, lw=2, ls="--", label=f"Greedy ({greedy_gap:.2f}%)")
+ax.axvline(seeds["gap_pct"].mean(), color=C_GA, lw=1.2, ls=":", label=f"GA mean ({seeds['gap_pct'].mean():.2f}%)")
+ax.set_yticks([]); ax.grid(axis="y", visible=False)
+ax.set_xlabel("optimality gap on full instance (%)"); ax.set_xlim(-0.15, 2.1)
+ax.legend(frameon=False, fontsize=8, loc="upper right")
+fig.tight_layout(); fig.savefig(OUT / "fig2_gap_seeds.png", dpi=200); plt.close(fig)
+
+
+# ---- Figure 3: GA convergence (seed 42) vs optimum and greedy ---------------
+curve = load_or_make("supp_ga_convergence_seed42.csv", make_convergence)
+fig, ax = plt.subplots(figsize=(6.2, 3.0))
+ax.plot(curve["generation"], curve["best_votes"], color=C_GA, lw=2, label="GA best-so-far (seed 42)")
+ax.axhline(OPT, color=C_EXACT, lw=1.6, label=f"CP-SAT optimum ({OPT:,.0f})")
+ax.axhline(GREEDY, color=C_GREEDY, lw=1.6, ls="--", label=f"Greedy ({GREEDY:,.0f})")
+ax.set_xlabel("generation"); ax.set_ylabel("total votes captured"); ax.set_ylim(280000, OPT * 1.009)
+ax.legend(frameon=False, loc="lower right", fontsize=8)
+fig.tight_layout(); fig.savefig(OUT / "fig3_ga_convergence.png", dpi=200); plt.close(fig)
+
+
+# ---- Figure 4: runtime vs instance size (capped model) ----------------------
+timing = load_or_make("supp_timing.csv", make_timing)
+timing = timing[timing["version"] == "with caps"]
+ga_time = load_or_make("supp_ga_seeds.csv", make_ga_per_size)
+fig, ax = plt.subplots(figsize=(6.2, 3.0))
+ax.plot(timing["n"], timing["cpsat_median"], "o-", color=C_EXACT, lw=2, label="CP-SAT (median of 15 runs)")
+ax.plot(timing["n"], timing["greedy_median"], "s-", color=C_GREEDY, lw=2, label="Greedy (median of 15 runs)")
+ax.plot(ga_time["n"], ga_time["time_mean"], "^-", color=C_GA, lw=2, label="GA (mean of 10 seeds)")
+ax.set_yscale("log"); ax.set_xlabel("number of candidate projects"); ax.set_ylabel("runtime (s, log scale)")
+ax.legend(frameon=False, fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.2), ncol=3)
+fig.tight_layout(); fig.savefig(OUT / "fig4_runtime.png", dpi=200); plt.close(fig)
+
+
+# ---- Figure 5: how much of each category cap the optimum uses ---------------
+spend = full[full["project_id"].isin(exact.selected_ids)].groupby("primary_category")["cost"].sum()
+use = pd.DataFrame({"spend": spend, "cap": pd.Series(caps)}).fillna(0)
+use["pct"] = use["spend"] / use["cap"] * 100
+use = use.sort_values("pct")
+fig, ax = plt.subplots(figsize=(6.2, 3.1))
+ax.barh(use.index, use["pct"], color=[C_EXACT if p >= 95 else "#9db7d6" for p in use["pct"]])
+ax.axvline(100, color=INK, lw=1)
+for i, p in enumerate(use["pct"]):
+    ax.text(p + 1.5, i, f"{p:.0f}%", va="center", fontsize=8, color=INK)
+ax.set_xlim(0, 115); ax.grid(axis="y", visible=False)
+ax.set_xlabel("share of category cap used by the CP-SAT optimum (%)")
+fig.tight_layout(); fig.savefig(OUT / "fig5_cap_usage.png", dpi=200); plt.close(fig)
+
+
