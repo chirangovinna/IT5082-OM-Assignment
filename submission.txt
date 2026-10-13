@@ -1,0 +1,10 @@
+Submission Details
+==================
+
+Problem: Resource Allocation (Budget)
+
+Dataset: Pabulib, Warszawa 2023 (138 projects, 30,339,246 PLN) (https://pabulib.org/visualize/Poland_Warszawa_2023.pb)
+
+GitHub Repository: https://github.com/chirangovinna/IT5082-OM-Assignment
+
+YouTube Video (15 min): https://www.youtube.com/
