@@ -31,6 +31,7 @@ src/greedy_baseline.py
 src/comparison.py    Runs all methods on all instances
 src/report_figures.py  Multi-seed study, timing, report figures
 results/             CSV tables and figures
+main.py              Runs the whole pipeline
 ```
 
 ## Setup and run
